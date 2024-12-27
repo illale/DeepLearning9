@@ -1,22 +1,24 @@
-import copy
 import os
 import random
 import sys
 
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
 import torch
-import torch.nn as nn
+import cv2
+import matplotlib.pyplot as plt
+
 from PIL import Image
 from sklearn.metrics import cohen_kappa_score, precision_score, recall_score, accuracy_score
-from torch.utils.data import Dataset, DataLoader
-from torchvision import models, transforms
-from torchvision.transforms.functional import to_pil_image
+from torch import nn
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+from torchvision import models
+from torchvision import transforms
 from tqdm import tqdm
 
 class RetinopathyDataset(Dataset):
-    def __init__(self, ann_file, image_dir, transform=None, mode='single', test=False):
+    def __init__(self, ann_file, image_dir, transform=None, mode='single', test=False, sampled=None):
         self.ann_file = ann_file
         self.image_dir = image_dir
         self.transform = transform
@@ -28,6 +30,7 @@ class RetinopathyDataset(Dataset):
                         transforms.ToTensor(),
                         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
+        self.sampled = sampled
 
         if self.mode == 'single':
             self.data = self.load_data()
@@ -51,6 +54,14 @@ class RetinopathyDataset(Dataset):
     # 1. single image
     def load_data(self):
         df = pd.read_csv(self.ann_file)
+
+        # Set random seed to important year in Finnish history
+        np.random.seed(1995)
+        
+        if self.sampled:
+            df = df.sample(frac=self.sampled, random_state=0)
+
+        np.random.seed(None)
 
         data = []
         for _, row in df.iterrows():
@@ -109,9 +120,9 @@ class RetinopathyDataset(Dataset):
 
         if not self.test:
             label = torch.tensor(data['dr_level'], dtype=torch.int64)
-            return [img1, img2], label
+            return torch.stack([img1, img2]), label
         else:
-            return [img1, img2]
+            return torch.stack([img1, img2])
 
 class SLORandomPad:
     def __init__(self, size):
@@ -137,11 +148,149 @@ class FundRandomRotate:
             return transforms.functional.rotate(img, angle)
         return img
 
+# From the template
+class ResNET18C(nn.Module):
+    def __init__(self, num_classes=5, dropout_rate=0.5):
+        super().__init__()
+
+        self.backbone = models.resnet18(pretrained=True)
+        self.backbone.fc = nn.Identity()  # Remove the original classification layer
+
+        self.fc = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.backbone(x)
+        x = self.fc(x)
+        return x
+
+class SpatialAttentionModule(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttentionModule, self).__init__()
+        assert kernel_size in (3, 7)
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        attn_map = torch.cat([avg_out, max_out], dim=1)
+        attn_map = self.conv(attn_map)
+        attn_map = self.sigmoid(attn_map)
+        return x * attn_map
+
+class ResNet18WithSAM(nn.Module):
+    def __init__(self, num_classes=5):
+        super(ResNet18WithSAM, self).__init__()
+        self.resnet18 = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        self.sam = SpatialAttentionModule(kernel_size=7)
+        self.resnet18.fc = nn.Linear(self.resnet18.fc.in_features, num_classes)
+
+    def forward(self, x):
+        x = self.resnet18.conv1(x)
+        x = self.resnet18.bn1(x)
+        x = self.resnet18.relu(x)
+        x = self.resnet18.maxpool(x)
+
+        x = self.resnet18.layer1(x)
+        x = self.resnet18.layer2(x)
+        x = self.resnet18.layer3(x)
+        x = self.resnet18.layer4(x)
+
+        x = self.sam(x)
+
+        x = self.resnet18.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.resnet18.fc(x)
+        return x
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        self._register_hooks()
+
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self.activations = output
+
+        def backward_hook(module, grad_in, grad_out):
+            self.gradients = grad_out[0]
+
+        self.forward_handle = self.target_layer.register_forward_hook(forward_hook)
+        self.backward_handle = self.target_layer.register_backward_hook(backward_hook)
+
+    def generate_cam(self, input_tensor, target_class=None):
+        self.model.eval()
+        self.model.zero_grad()
+
+        output = self.model(input_tensor)
+
+        if target_class is None:
+            target_class = output.argmax(dim=1).item()
+        target = output[:, target_class]
+
+        target.backward()
+
+        gradients = self.gradients.detach().cpu().numpy()[0]
+        activations = self.activations.detach().cpu().numpy()[0]
+
+        weights = np.mean(gradients, axis=(1, 2))
+
+        cam = np.zeros(activations.shape[1:], dtype=np.float32)
+        for i, w in enumerate(weights):
+            cam += w * activations[i]
+
+        cam = np.maximum(cam, 0)
+        cam = cv2.resize(cam, (input_tensor.shape[3], input_tensor.shape[2]))
+        cam = cam - np.min(cam)
+        cam = cam / np.max(cam)
+        return cam
+
+    def remove_hooks(self):
+        self.forward_handle.remove()
+        self.backward_handle.remove()
+
+
+def visualize_gradcam(input_tensor, cam, title='Grad-CAM'):
+    img = input_tensor.clone().cpu().numpy()
+    img = np.transpose(img, (1, 2, 0))
+
+    means = np.array([0.485, 0.456, 0.406])
+    stds  = np.array([0.229, 0.224, 0.225])
+    img = (img * stds + means).clip(0,1)
+    img = (img * 255).astype(np.uint8)
+
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    heatmap = heatmap.astype(np.float32) / 255.0
+
+    overlay = 0.5 * img.astype(np.float32) / 255.0 + 0.5 * heatmap
+    overlay = overlay / np.max(overlay)
+
+    plt.imshow(overlay)
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
 def train_model(model, train_loader, val_loader, device, criterion, optimizer, lr_scheduler, num_epochs=25,
                 checkpoint_path='model.pth'):
     best_model = model.state_dict()
     best_epoch = None
     best_val_kappa = -1.0  # Initialize the best kappa score
+    best_val_metrics = None
+    best_val_preds = None
+    best_val_labels = None
     kappas = np.zeros(num_epochs)
 
     for epoch in range(1, num_epochs + 1):
@@ -168,7 +317,7 @@ def train_model(model, train_loader, val_loader, device, criterion, optimizer, l
 
                 loss.backward()
                 optimizer.step()
-
+    
                 preds = torch.argmax(outputs, 1)
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
@@ -194,7 +343,7 @@ def train_model(model, train_loader, val_loader, device, criterion, optimizer, l
                 print(f'[Train] Class {i}: Precision: {precision:.4f}, Recall: {recall:.4f}')
 
         # Evaluation on the validation set at the end of each epoch
-        val_metrics = evaluate_model(model, val_loader, device)
+        val_metrics, val_preds, val_labels = evaluate_model(model, val_loader, device)
         val_kappa, val_accuracy, val_precision, val_recall = val_metrics[:4]
         print(f'[Val] Kappa: {val_kappa:.4f} Accuracy: {val_accuracy:.4f} '
               f'Precision: {val_precision:.4f} Recall: {val_recall:.4f}')
@@ -204,11 +353,14 @@ def train_model(model, train_loader, val_loader, device, criterion, optimizer, l
             best_val_kappa = val_kappa
             best_epoch = epoch
             best_model = model.state_dict()
+            best_val_metrics = val_metrics
+            best_val_preds = val_preds
+            best_val_labels = val_labels
             torch.save(best_model, checkpoint_path)
 
     print(f'[Val] Best kappa: {best_val_kappa:.4f}, Epoch {best_epoch}')
 
-    return model, kappas
+    return model, kappas, best_val_metrics, best_val_preds, best_val_labels
 
 def evaluate_model(model, test_loader, device, test_only=False, prediction_path='./test_predictions.csv'):
     model.eval()
@@ -266,9 +418,60 @@ def evaluate_model(model, test_loader, device, test_only=False, prediction_path=
         })
         df.to_csv(prediction_path, index=False)
         print(f'[Test] Save predictions to {os.path.abspath(prediction_path)}')
+        return None
     else:
         metrics = compute_metrics(all_preds, all_labels)
-        return metrics
+        return metrics, all_preds, all_labels
+
+def run_model(mode, name, model, optimizer=None, num_epochs=20, batch_size=24, learning_rate=0.0001, sampled=None, transform_train=None, transform_test=None, prefix='model_1'):
+    # Create datasets
+    train_dataset = RetinopathyDataset('./DeepDRiD/train.csv', './DeepDRiD/train/', transform_train, mode, sampled=sampled)
+    val_dataset = RetinopathyDataset('./DeepDRiD/val.csv', './DeepDRiD/val/', transform_test, mode)
+    test_dataset = RetinopathyDataset('./DeepDRiD/test.csv', './DeepDRiD/test/', transform_test, mode, test=True)
+
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    # Define the weighted CrossEntropyLoss
+    criterion = nn.CrossEntropyLoss()
+
+    # Use GPU device is possible
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Device:', device)
+
+    # Move class weights to the device
+    model = model.to(device)
+
+    # Optimizer and Learning rate scheduler
+    if optimizer is None:
+        optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
+    from torch.optim.lr_scheduler import OneCycleLR
+    #steps_per_epoch = 10
+    #max_lr = 0.01
+    #lr_scheduler = OneCycleLR(optimizer,
+    #                   max_lr=max_lr,
+    #                   steps_per_epoch=steps_per_epoch,
+    #                   epochs=num_epochs)
+
+    # Train and evaluate the model with the training and validation set
+    model, kappas, val_metrics, val_preds, val_labels = train_model(
+        model, train_loader, val_loader, device, criterion, optimizer,
+        lr_scheduler=lr_scheduler, num_epochs=num_epochs,
+        checkpoint_path='./{}_{}.pth'.format(prefix, name)
+    )
+
+    # Load the pretrained checkpoint
+    state_dict = torch.load('./{}_{}.pth'.format(prefix, name), map_location=device)
+    model.load_state_dict(state_dict, strict=True)
+
+    # Make predictions on testing set and save the prediction results
+    evaluate_model(model, test_loader, device, test_only=True, prediction_path="./test_predictions_{}_{}.csv".format(prefix, name))
+
+    return model, kappas, val_metrics, val_preds, val_labels
 
 def compute_metrics(preds, labels, per_class=False):
     kappa = cohen_kappa_score(labels, preds, weights='quadratic')
